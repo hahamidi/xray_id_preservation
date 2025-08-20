@@ -1,22 +1,11 @@
-"""
-High-level training template (pseudocode) for a Diffusion+Adapters setup.
-
-INPUTS
-- YAML config (matches your schema) describing model/data/weights.
-- Dataset on disk (paths in the YAML).
-- Optional pretrained weights (UNet, VAE, text encoder, adapters).
-
-OUTPUTS
-- Checkpoints saved under output_dir/checkpoint-<global_step>.
-- Logs in output_dir/logs for the chosen tracker (e.g., TensorBoard).
-"""
-
 # --- std lib ---
 import os
 import time
 import argparse
 from pathlib import Path
 import yaml
+import warnings
+from typing import Any, Dict, Optional, Tuple
 
 # --- torch / accelerate ---
 import torch
@@ -30,14 +19,15 @@ from accelerate.utils import ProjectConfiguration
 # --- diffusers / transformers (core building blocks) ---
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from transformers import CLIPTokenizer
+from utils_idp import report_module
 
 # --- your project-specific imports (placeholders / TODOs) ---
 # from your_project.data import DAVIS_Dataset, collate_fn
-# from your_project.encoders import DynamicEncoder                      # (optional)
-# from modify_instantID import FrozenDinoV2Encoder                       # image encoder
+# from your_project.encoders import DynamicEncoder
+# from modify_instantID import FrozenDinoV2Encoder
 # from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 # from ip_adapter.utils import is_torch2_available
-# (We will wire these up in the concrete implementation.)
+
 
 # ------------------------------------------------------------
 # Utility: resolve "module.ClassName" strings to actual classes
@@ -53,7 +43,7 @@ def locate(target: str):
     return getattr(mod, cls_name)
 
 
-def instantiate_from_target(target: str, params: dict | None):
+def instantiate_from_target(target: str, params: Optional[Dict] = None):
     """
     Generic factory: instantiate any class by target string + kwargs.
     """
@@ -64,7 +54,7 @@ def instantiate_from_target(target: str, params: dict | None):
 # ------------------------------------------------------------
 # Optional helpers for freezing and weight loading
 # ------------------------------------------------------------
-def maybe_freeze(module: nn.Module | None, train_flag: bool):
+def maybe_freeze(module: Optional[nn.Module], train_flag: bool):
     """
     If module exists: set requires_grad to train_flag.
     """
@@ -73,7 +63,7 @@ def maybe_freeze(module: nn.Module | None, train_flag: bool):
     module.requires_grad_(bool(train_flag))
 
 
-def maybe_load_state_dict(module: nn.Module | None, path: str | None, strict: bool = False):
+def maybe_load_state_dict(module: Optional[nn.Module], path: Optional[str], strict: bool = False):
     """
     If module & path provided: load a state_dict from disk.
     """
@@ -84,10 +74,9 @@ def maybe_load_state_dict(module: nn.Module | None, path: str | None, strict: bo
 
 
 from pydoc import locate as pydoc_locate
-import warnings
-import torch.nn as nn
 
-def set_ip_adapters(unet: UNet2DConditionModel, adapters_cfg: dict, device, dtype) -> nn.Module:
+
+def set_ip_adapters(unet: UNet2DConditionModel, adapters_cfg: Optional[Dict], device, dtype) -> nn.Module:
     if not adapters_cfg:
         return nn.ModuleList()
 
@@ -100,10 +89,6 @@ def set_ip_adapters(unet: UNet2DConditionModel, adapters_cfg: dict, device, dtyp
         raise ImportError(f"Could not locate adapter class: '{target_path}'")
 
     base_params = dict(adapters_cfg.get("params", {}))
-    # optional: allow remapping kv names via config
-    kv_names = adapters_cfg.get("kv_param_names", {"k": "to_k_ip.weight", "v": "to_v_ip.weight"})
-
-    # read once before swap
     unet_sd = unet.state_dict()
     attn_procs = {}
     adapters = []
@@ -111,7 +96,6 @@ def set_ip_adapters(unet: UNet2DConditionModel, adapters_cfg: dict, device, dtyp
     for name, proc in list(unet.attn_processors.items()):
         is_self_attn = name.endswith("attn1.processor")
 
-        # try to derive hidden_size from name; skip unknowns instead of hard-fail
         hidden_size = None
         if name.startswith("mid_block"):
             hidden_size = unet.config.block_out_channels[-1]
@@ -123,20 +107,14 @@ def set_ip_adapters(unet: UNet2DConditionModel, adapters_cfg: dict, device, dtyp
             hidden_size = unet.config.block_out_channels[block_id]
         else:
             warnings.warn(f"Skipping unknown attention processor location: {name}")
-            attn_procs[name] = proc  # keep existing
-            continue
-
-        if is_self_attn:
-            # leave self-attn unchanged; if you *must* reset:
-            # attn_procs[name] = AttnProcessor().to(device=device, dtype=dtype)
             attn_procs[name] = proc
             continue
 
-        # try to infer cross_attention_dim from the module if possible
-        cross_attention_dim = getattr(unet, "config", None)
-        if cross_attention_dim is not None:
-            cross_attention_dim = unet.config.cross_attention_dim
-        # if you want to be safer, introspect the underlying attention module here.
+        if is_self_attn:
+            attn_procs[name] = proc
+            continue
+
+        cross_attention_dim = getattr(unet.config, "cross_attention_dim", None)
 
         params = dict(base_params)
         params.update(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
@@ -145,14 +123,18 @@ def set_ip_adapters(unet: UNet2DConditionModel, adapters_cfg: dict, device, dtyp
         if hasattr(adapter, "to"):
             adapter = adapter.to(device=device, dtype=dtype)
 
-        # warm start: map UNet's to_k/to_v to adapter's expected names
+        # --- inline robust warm start
         prefix = name.rsplit(".processor", 1)[0]
-        k_key, v_key = f"{prefix}.to_k.weight", f"{prefix}.to_v.weight"
+        src_k, src_v = f"{prefix}.to_k.weight", f"{prefix}.to_v.weight"
+
         state = {}
-        if k_key in unet_sd and kv_names.get("k"):
-            state[kv_names["k"]] = unet_sd[k_key]
-        if v_key in unet_sd and kv_names.get("v"):
-            state[kv_names["v"]] = unet_sd[v_key]
+        for ad_key, ad_tensor in adapter.state_dict().items():
+            if ad_key.endswith("weight"):
+                if "k" in ad_key and src_k in unet_sd and unet_sd[src_k].shape == ad_tensor.shape:
+                    state[ad_key] = unet_sd[src_k]
+                elif "v" in ad_key and src_v in unet_sd and unet_sd[src_v].shape == ad_tensor.shape:
+                    state[ad_key] = unet_sd[src_v]
+
         if state:
             missing, unexpected = adapter.load_state_dict(state, strict=False)
             if missing or unexpected:
@@ -173,26 +155,19 @@ def set_ip_adapters(unet: UNet2DConditionModel, adapters_cfg: dict, device, dtyp
 # Model wrapper that concatenates text/image/label tokens
 # ------------------------------------------------------------
 class MultiAdaptorSDXL(nn.Module):
-    """
-    Wrap UNet and the token projectors:
-      - text_tokens: [B, T_txt, D_text]
-      - image_embeds: [B, T_img, D_img]  -> project -> [B, T_img, D_text]
-      - label_embeds: [B, T_lab, D_lab]  -> project -> [B, T_lab, D_text]
-    """
     def __init__(self, unet):
         super().__init__()
         self.unet = unet
 
     def forward(
         self,
-        noisy_latents,                # [B,4,H/8,W/8]
-        timesteps,                    # [B]
-        text_tokens,                  # [B,T_txt,D_text] (can be None if UNet expects raw ids)
-        added_cond_kwargs=None,       # SDXL "time_ids" etc.
-        image_tokens=None,            # [B,T_img,D_img]
-        label_tokens=None,            # [B,T_lab,D_lab]
+        noisy_latents,
+        timesteps,
+        text_tokens,
+        added_cond_kwargs=None,
+        image_tokens=None,
+        label_tokens=None,
     ):
-        # Concatenate condition sequences that unet.cross-attn will attend to
         seqs = []
         if text_tokens is not None:
             seqs.append(text_tokens)
@@ -215,23 +190,7 @@ class MultiAdaptorSDXL(nn.Module):
 # ------------------------------------------------------------
 # YAML config parser & builder
 # ------------------------------------------------------------
-import warnings
-from typing import Any, Dict, Optional, Tuple
-
 def build_from_yaml(config_path: str):
-    """
-    Returns (in order):
-      raw_cfg               : the raw YAML dict
-      adapter_cfg           : dict or None
-      scheduler             : DDPMScheduler
-      vae                   : AutoencoderKL
-      unet                  : UNNet2DConditionModel
-      text_encoder          : optional encoder returning [B,T,D]
-      image_to_token_model  : optional projector for image/embed -> text dim
-      label_to_token_model  : optional projector for label -> text dim
-      toggles               : dict of trainable flags (empty => train all)
-      weights               : dict of weight paths (empty => none)
-    """
     with open(config_path, "r") as f:
         raw_cfg: Dict[str, Any] = yaml.safe_load(f)
 
@@ -241,14 +200,12 @@ def build_from_yaml(config_path: str):
         vae_params = mcfg["first_stage_config"]["params"]
         unet_params = mcfg["unet_config"]["params"]
     except KeyError as e:
-        raise KeyError(f"Missing required config key in YAML: {e}. "
-                       f"Expected model.scheduler_config/first_stage_config/unet_config with 'params'.") from e
+        raise KeyError(f"Missing required config key in YAML: {e}.") from e
 
     scheduler = DDPMScheduler.from_config(sch_params)
-    vae       = AutoencoderKL.from_config(vae_params)
-    unet      = UNet2DConditionModel.from_config(unet_params)
+    vae = AutoencoderKL.from_config(vae_params)
+    unet = UNet2DConditionModel.from_config(unet_params)
 
-    # Optional text/cond encoder
     cond_encoder = None
     cond_cfg = mcfg.get("cond_stage_config")
     if cond_cfg:
@@ -256,9 +213,6 @@ def build_from_yaml(config_path: str):
             cond_cfg["target"], cond_cfg.get("params", {})
         )
 
-    # -------------------------------
-    # Global token conditioners
-    # -------------------------------
     token_conditioners_cfg = mcfg.get("token_conditioners", {}) or {}
 
     label_to_token_model = None
@@ -269,24 +223,21 @@ def build_from_yaml(config_path: str):
         )
 
     image_to_token_model = None
-    embed_cfg = token_conditioners_cfg.get("embed_to_token")
+    embed_cfg = token_conditioners_cfg.get("image_to_token")
     if embed_cfg:
         image_to_token_model = instantiate_from_target(
             embed_cfg["target"], embed_cfg.get("params", {})
         )
 
-    # Trainable toggles & weight paths
     toggles: Dict[str, Any] = mcfg.get("trainable")
     if toggles is None:
         toggles = {}
-        warnings.warn("No 'trainable' section found in model config; "
-                      "defaulting to 'train all' semantics.")
+        warnings.warn("No 'trainable' section found; defaulting to train all.")
 
     weights: Dict[str, Any] = mcfg.get("weights")
     if weights is None:
         weights = {}
-        warnings.warn("No 'weights' section found in model config; "
-                      "assuming fresh init (no pretrained weights).")
+        warnings.warn("No 'weights' section found; assuming fresh init.")
 
     adapter_cfg: Optional[Dict[str, Any]] = mcfg.get("adapters_config")
 
@@ -295,8 +246,9 @@ def build_from_yaml(config_path: str):
         image_to_token_model, label_to_token_model, toggles, weights
     )
 
+
 # ------------------------------------------------------------
-# Arg parsing (only the interface, defaults can be tuned later)
+# Arg parsing
 # ------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser()
@@ -316,10 +268,9 @@ def parse_args():
 
 
 # ------------------------------------------------------------
-# Main (high-level flow only; details marked as TODO)
+# Main
 # ------------------------------------------------------------
 def main():
-    # 1) Parse CLI args and set up accelerate/logging
     args = parse_args()
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator = Accelerator(
@@ -330,27 +281,18 @@ def main():
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    # 2) Build modules from YAML (configs only—no weights yet)
     (
         raw_cfg, adapter_cfg, scheduler, vae, unet, cond_encoder,
         image_to_token_model, label_to_token_model, toggles, weights
-
     ) = build_from_yaml(args.config)
 
-
-
-    # TODO: your image encoder (frozen DINOv2) — returns per-image embeddings
-    # image_encoder = FrozenDinoV2Encoder(DINOv2_weight_path=cfg["model"]["params"].get("dino_weight_path"))
-    # image_encoder.requires_grad_(False)
-
-    # 4) Device & dtype policy
     weight_dtype = (
         torch.float16 if accelerator.mixed_precision == "fp16"
         else torch.bfloat16 if accelerator.mixed_precision == "bf16"
         else torch.float32
     )
     unet.to(accelerator.device, dtype=weight_dtype)
-    vae.to(accelerator.device)  # keep VAE in fp32 typically
+    vae.to(accelerator.device)
     if cond_encoder is not None:
         cond_encoder.to(accelerator.device, dtype=weight_dtype)
     if image_to_token_model is not None:
@@ -358,104 +300,53 @@ def main():
     if label_to_token_model is not None:
         label_to_token_model.to(accelerator.device, dtype=weight_dtype)
 
-    # 5) Install IP-Adapters into UNet (sets custom attention processors)
     adapter_modules = set_ip_adapters(
         unet=unet, device=accelerator.device, dtype=weight_dtype, adapters_cfg=adapter_cfg
     )
 
-    # 6) Freeze/train toggles
-    maybe_freeze(unet,          toggles.get("unet", True))
-    maybe_freeze(cond_encoder,  toggles.get("cond_encoder", False))
+    maybe_freeze(unet, toggles.get("unet", True))
+    maybe_freeze(cond_encoder, toggles.get("cond_encoder", False))
     maybe_freeze(image_to_token_model, toggles.get("image_to_token", True))
     maybe_freeze(label_to_token_model, toggles.get("label_to_token", True))
-    maybe_freeze(adapter_modules,  toggles.get("adapters", True))
+    maybe_freeze(adapter_modules, toggles.get("adapters", True))
     vae.requires_grad_(False)
 
-    # 7) Optional: load weights after modules exist
-    maybe_load_state_dict(unet,            weights.get("main_model") or weights.get("unet"))
-    maybe_load_state_dict(vae,             weights.get("vae"))
-    # maybe_load_state_dict(text_encoder,  weights.get("text_encoder"))
-    # maybe_load_state_dict(image_proj_model, weights.get("image_proj"))
-    # maybe_load_state_dict(label_proj_model, weights.get("label_proj"))
-    maybe_load_state_dict(adapter_modules,  weights.get("ip_adapters"))
+    maybe_load_state_dict(unet, weights.get("main_model") or weights.get("unet"))
+    maybe_load_state_dict(vae, weights.get("vae"))
+    maybe_load_state_dict(cond_encoder, weights.get("cond_encoder"))
+    maybe_load_state_dict(image_to_token_model, weights.get("image_to_token"))
+    maybe_load_state_dict(label_to_token_model, weights.get("label_to_token"))
+    maybe_load_state_dict(adapter_modules, weights.get("adapters"))
 
-    # 8) Wrap model to handle multi-conditions
-    model = MultiAdaptorSDXL(
-        unet=unet,
-        image_proj_model=image_proj_model,
-        label_proj_model=label_proj_model,
-        adapter_modules=adapter_modules,
-    )
+    model = MultiAdaptorSDXL(unet=unet)
+    # print report here what is state of created objects
+        # print report here what is state of created objects
+    def _fmt(n: int) -> str:
+        # format numbers in human-readable units
+        if n >= 1e9:
+            return f"{n/1e9:.2f}B"
+        elif n >= 1e6:
+            return f"{n/1e6:.2f}M"
+        elif n >= 1e3:
+            return f"{n/1e3:.2f}K"
+        return str(n)
 
-    # 9) Optimizer over trainable params
-    param_groups = []
-    if any(p.requires_grad for p in model.unet.parameters()):
-        param_groups.append(model.unet.parameters())
-    if text_encoder is not None and any(p.requires_grad for p in text_encoder.parameters()):
-        param_groups.append(text_encoder.parameters())
-    if image_proj_model is not None and any(p.requires_grad for p in image_proj_model.parameters()):
-        param_groups.append(image_proj_model.parameters())
-    if label_proj_model is not None and any(p.requires_grad for p in label_proj_model.parameters()):
-        param_groups.append(label_proj_model.parameters())
-    if adapter_modules is not None and any(p.requires_grad for p in adapter_modules.parameters()):
-        param_groups.append(adapter_modules.parameters())
 
-    optimizer = torch.optim.AdamW(
-        params=(p for group in param_groups for p in group),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
 
-    # 10) Dataset / DataLoader (your dataset must return the fields used below)
-    # train_dataset = DAVIS_Dataset(
-    #     tokenizer=tokenizer,
-    #     tokenizer_2=tokenizer,  # kept for compatibility
-    #     size=cfg["data"]["params"].get("resolution", 1024),
-    #     image_root_path=cfg["data"]["params"]["data_root_path"],
-    #     pairs_file_path=cfg["data"]["params"]["pairs_file_path"],
-    # )
-    # train_dataloader = DataLoader(
-    #     train_dataset,
-    #     shuffle=True,
-    #     collate_fn=collate_fn,
-    #     batch_size=args.train_batch_size,
-    #     num_workers=args.dataloader_num_workers,
-    # )
+    print("\n========== MODEL REPORT ==========")
+    report_module("UNet", unet)
+    report_module("VAE", vae)
+    report_module("CondEncoder", cond_encoder)
+    report_module("ImageToToken", image_to_token_model)
+    report_module("LabelToToken", label_to_token_model)
+    report_module("Adapters", adapter_modules)
 
-    # 11) Prepare with accelerator
-    # model, optimizer, train_dataloader, image_encoder = accelerator.prepare(
-    #     model, optimizer, train_dataloader, image_encoder
-    # )
+    print(f"[REPORT] MultiAdaptorSDXL wrapper: {model.__class__.__name__}")
+    print("=================================\n")
 
-    # 12) Training loop (outline)
-    global_step = 0
-    for epoch in range(args.num_train_epochs):
-        # for step, batch in enumerate(train_dataloader):
-        #     with accelerator.accumulate(model):
-        #         # (a) Encode images to latents (no grad)
-        #         # latents: encode with VAE, scale by vae.config.scaling_factor
-        #         # (b) Sample noise & timesteps, add noise via scheduler
-        #         # (c) Build condition tokens:
-        #         #     - text_tokens = text_encoder(input_ids)
-        #         #     - image_embeds = image_encoder(...) -> (maybe drop some)
-        #         #     - label_embeds = batch.get("label_embeds", None)
-        #         # (d) SDXL added cond (time_ids) from batch (original_size, crops, etc.)
-        #         # (e) Forward UNet -> noise_pred
-        #         # (f) Loss = MSE(noise_pred, noise)
-        #         # (g) backward + step + zero_grad
-        #         pass
 
-        #     # (h) Save periodic checkpoints
-        #     if accelerator.is_main_process and (global_step % args.save_steps == 0):
-        #         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-        #         accelerator.save_state(save_path)
 
-        #     global_step += 1
-        pass  # end epoch
 
-    # 13) (Optional) Save final state
-    # if accelerator.is_main_process:
-    #     accelerator.save_state(os.path.join(args.output_dir, "checkpoint-final"))
 
 
 if __name__ == "__main__":

@@ -44,38 +44,29 @@ model:
         use_linear_projection: false
 
   cond_stage_config:
-      target: your_project.encoders.DynamicEncoder
+      target: encoders.encoders.SimpleSDTextEncoder
       params:
-        encode_key: text   # [text | label | image]
-        model_name_or_path: null
-        trainable: false
+        model_name_or_path: openai/clip-vit-base-patch32
+        max_length: 77
+        from_key: captions         # batch["captions"]
+        pad_to_max_length: true
+        tokenizers_parallelism: false
 
     # per-layer adapters stay here
   adapters_config:
-      target: your_project.adapters.IPAdapters
+      target: modules.adapter.IPAttnProcessor
       params:
-        ip_scale_image: 1
-        ip_scale_label: 1
-        ip_num_tokens_image: 4
-        ip_num_tokens_label: 4
-
-        # image_projector:
-        #   target: torch.nn.Linear
-        #   params:
-        #     in_features: 2048
-        #     out_features: 2048
-
-        # label_projector:
-        #   target: torch.nn.Linear
-        #   params:
-        #     in_features: 2048
-        #     out_features: 2048
+        scale_image: 1
+        scale_label: 1
+        num_tokens_image: 4
+        num_tokens_label: 4
+        share_ip_kv: true
 
   # ------------------------------------------------------------
   # Config for token conditioners (global encoders)
   # ------------------------------------------------------------
-  model:
-    token_conditioners:
+
+  token_conditioners:
       label_to_token:
         target: encoders.encoders.LabelToToken
         params:
@@ -107,7 +98,8 @@ model:
       image_to_token: null          # NEW
 
 data:
-  target: your_project.data.DatasetClass
+  target: datasets.datasets.DummyMultiModalDataset
   params:
-    resolution: 1024
-    # other paramters
+    num_samples: 1000        # number of samples to generate
+    label_dim: 14            # size of the label vector
+    image_dim: 1024          # size of the image embedding

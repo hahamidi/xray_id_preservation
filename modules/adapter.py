@@ -35,7 +35,7 @@ class IPAttnProcessor(nn.Module):
         self,
         hidden_size: int,
         cross_attention_dim: Optional[int] = None,
-        *,
+        *, # above parameters come first from the base Unet. below are based on the config file
         scale_image: Optional[float] = 1.0,
         scale_label: Optional[float] = 1.0,
         num_tokens_image: int = 4,
