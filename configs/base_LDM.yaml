@@ -1,0 +1,89 @@
+model:
+  base_learning_rate: 5.0e-05
+  target: your_project.trainer.entrypoint
+  params:
+    tokenizer_name_or_path: stabilityai/stable-diffusion-xl-base-1.0
+
+    scheduler_config:
+      target: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+      params:
+        num_train_timesteps: 1000
+        beta_start: 0.00085
+        beta_end: 0.012
+        beta_schedule: scaled_linear
+        prediction_type: epsilon
+        clip_sample: false
+        variance_type: fixed_small
+
+    first_stage_config:
+      target: diffusers.models.autoencoder_kl.AutoencoderKL
+      params:
+        act_fn: silu
+        block_out_channels: [128, 256, 512, 512]
+        down_block_types: [DownEncoderBlock2D, DownEncoderBlock2D, DownEncoderBlock2D, DownEncoderBlock2D]
+        up_block_types:   [UpDecoderBlock2D,   UpDecoderBlock2D,   UpDecoderBlock2D,   UpDecoderBlock2D]
+        latent_channels: 4
+        in_channels: 3
+        out_channels: 3
+        scaling_factor: 0.18215
+
+    unet_config:
+      target: diffusers.models.unet_2d_condition.UNet2DConditionModel
+      params:
+        sample_size: 64
+        in_channels: 4
+        out_channels: 4
+        down_block_types: [DownBlock2D, CrossAttnDownBlock2D, CrossAttnDownBlock2D, CrossAttnDownBlock2D]
+        mid_block_type: UNetMidBlock2DCrossAttn
+        up_block_types:   [UpBlock2D, CrossAttnUpBlock2D, CrossAttnUpBlock2D, CrossAttnUpBlock2D]
+        block_out_channels: [320, 640, 1280, 1280]
+        layers_per_block: 2
+        cross_attention_dim: 2048
+        attention_head_dim: [8, 8, 8, 8]
+        center_input_sample: false
+        flip_sin_to_cos: true
+        freq_shift: 0
+        downsample_padding: 1
+        resnet_time_scale_shift: default
+        use_linear_projection: false
+
+    cond_stage_config:
+      target: your_project.encoders.DynamicEncoder
+      params:
+        encode_key: text   # [text | label | image]
+        model_name_or_path: null  # optional external model
+        trainable: false
+
+    adapters_config:
+      ip_scale_image: 1
+      ip_scale_label: 1
+      ip_num_tokens_image: 4
+      ip_num_tokens_label: 4
+
+      image_in_dim: 1536
+      image_projector:
+        target: torch.nn.Linear
+        params:
+          in_features: 1536
+          out_features: 2048
+          trainable: true
+
+      label_in_dim: 512
+      label_projector:
+        target: torch.nn.Linear
+        params:
+          in_features: 512
+          out_features: 2048
+          trainable: true
+
+    weights:
+      main_model: null      # path to UNet/text encoder checkpoint
+      vae: null             # path to VAE checkpoint
+      ip_adapters: null     # path to adapters checkpoint
+
+data:
+  target: your_project.data.DatasetClass
+  params:
+    resolution: 1024
+    data_root_path: /home/lijiahui/dataset/DAVIS_2016
+    pairs_file_path: /home/lijiahui/dataset/DAVIS_2016/ImageSets/1080p/train.txt
