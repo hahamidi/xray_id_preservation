@@ -1,10 +1,6 @@
 model:
   base_learning_rate: 5.0e-05
-  target: your_project.trainer.entrypoint
-  params:
-    tokenizer_name_or_path: stabilityai/stable-diffusion-xl-base-1.0
-
-    scheduler_config:
+  scheduler_config:
       target: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
       params:
         num_train_timesteps: 1000
@@ -15,7 +11,7 @@ model:
         clip_sample: false
         variance_type: fixed_small
 
-    first_stage_config:
+  first_stage_config:
       target: diffusers.models.autoencoder_kl.AutoencoderKL
       params:
         act_fn: silu
@@ -27,7 +23,7 @@ model:
         out_channels: 3
         scaling_factor: 0.18215
 
-    unet_config:
+  unet_config:
       target: diffusers.models.unet_2d_condition.UNet2DConditionModel
       params:
         sample_size: 64
@@ -47,7 +43,7 @@ model:
         resnet_time_scale_shift: default
         use_linear_projection: false
 
-    cond_stage_config:
+  cond_stage_config:
       target: your_project.encoders.DynamicEncoder
       params:
         encode_key: text   # [text | label | image]
@@ -55,7 +51,7 @@ model:
         trainable: false
 
     # per-layer adapters stay here
-    adapters_config:
+  adapters_config:
       target: your_project.adapters.IPAdapters
       params:
         ip_scale_image: 1
@@ -63,53 +59,55 @@ model:
         ip_num_tokens_image: 4
         ip_num_tokens_label: 4
 
-        image_projector:
-          target: torch.nn.Linear
-          params:
-            in_features: 2048
-            out_features: 2048
+        # image_projector:
+        #   target: torch.nn.Linear
+        #   params:
+        #     in_features: 2048
+        #     out_features: 2048
 
-        label_projector:
-          target: torch.nn.Linear
-          params:
-            in_features: 2048
-            out_features: 2048
+        # label_projector:
+        #   target: torch.nn.Linear
+        #   params:
+        #     in_features: 2048
+        #     out_features: 2048
 
-    # NEW: two separate, model-level token networks (NOT per-layer)
+  # ------------------------------------------------------------
+  # Config for token conditioners (global encoders)
+  # ------------------------------------------------------------
+  model:
     token_conditioners:
       label_to_token:
-        target: torch.nn.Linear
+        target: encoders.encoders.LabelToToken
         params:
           ip_num_tokens_label: 4
-          in_features: 14          # raw label vector dim
-          out_features: 2048        
-      embed_to_token:
-        target: torch.nn.Linear
+          in_features: 14
+          out_features: 2048
+          from_key: labels          # module will read batch["labels"]
+      image_to_token:
+        target: encoders.encoders.ImageToToken
         params:
           ip_num_tokens_image: 4
-          in_features: 1024         # external embedding dim
-          out_features: 2048        
+          in_features: 1024
+          out_features: 2048
+          from_key: image_embeds    # module will read batch["image_embeds"]  
 
     # Optional toggles (so you can freeze/train these nets)
-    trainable:
+  trainable:
       unet: true
-      text_encoder: false
-      image_proj: true
-      label_proj: true
-      ip_adapters: true
+      cond_stage: false
+      adapters: true
       label_to_token: true          # NEW
       embed_to_token: true          # NEW
 
-    weights:
+  weights:
       main_model: null
       vae: null
-      ip_adapters: null
+      adapters: null
       label_to_token: null          # NEW: path if you have a checkpoint
-      embed_to_token: null          # NEW
+      image_to_token: null          # NEW
 
 data:
   target: your_project.data.DatasetClass
   params:
     resolution: 1024
-    data_root_path: /home/lijiahui/dataset/DAVIS_2016
-    pairs_file_path: /home/lijiahui/dataset/DAVIS_2016/ImageSets/1080p/train.txt
+    # other paramters
