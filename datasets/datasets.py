@@ -24,6 +24,7 @@ class DummyMultiModalDataset(Dataset):
             "labels": torch.randn(self.label_dim),     # [14]
             "image_embeds": torch.randn(self.image_dim),  # [1024]
             "captions": self.caption_templates[idx % len(self.caption_templates)],
+            "images": torch.randn(3, 224, 224),  # Simulated image tensor [3, 224, 224]
         }
         return sample
     

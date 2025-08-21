@@ -21,8 +21,7 @@ class LabelToToken(nn.Module):
 
         self.proj = nn.Linear(in_features, out_features * self.num_tokens)
 
-    def forward(self, batch: dict) -> torch.Tensor:
-        x = batch[self.from_key]          # e.g. batch["labels"], shape [B, in_features]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         b = x.size(0)
         out = self.proj(x)                # [B, num_tokens*out_features]
         return out.view(b, self.num_tokens, self.out_features)  # [B, T, D]
@@ -41,8 +40,7 @@ class ImageToToken(nn.Module):
 
         self.proj = nn.Linear(in_features, out_features * self.num_tokens)
 
-    def forward(self, batch: dict) -> torch.Tensor:
-        x = batch[self.from_key]          # e.g. batch["image_embeds"], shape [B, in_features]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         b = x.size(0)
         out = self.proj(x)                # [B, num_tokens*out_features]
         return out.view(b, self.num_tokens, self.out_features)  # [B, T, D]
@@ -51,17 +49,17 @@ class ImageToToken(nn.Module):
 
 
 
+from typing import Dict, List, Union, Optional
+import torch
+import torch.nn as nn
+from transformers import CLIPTokenizer, CLIPTextModel
+
 class SimpleSDTextEncoder(nn.Module):
     """
-    Simple Stable Diffusion-style text encoder (single CLIP).
-    Reads text strings from batch[from_key], tokenizes, and returns embeddings [B, T, D].
-
-    Example config:
-      target: encoders.text_encoders.SimpleSDTextEncoder
-      params:
-        model_name_or_path: openai/clip-vit-base-patch32
-        max_length: 77
-        from_key: captions
+    Reads text strings from batch[from_key] (or token IDs) and returns embeddings [B, T, D].
+    Usage:
+        ids = enc.tokenize(batch)       # batch[from_key] is list[str] or token IDs
+        hidden = enc(ids)               # [B, T, D]
     """
 
     def __init__(
@@ -73,36 +71,59 @@ class SimpleSDTextEncoder(nn.Module):
         tokenizers_parallelism: bool = False,
     ):
         super().__init__()
-
+        import os
         os.environ["TOKENIZERS_PARALLELISM"] = "true" if tokenizers_parallelism else "false"
 
         self.from_key = from_key
         self.max_length = max_length
         self.pad_to_max_length = pad_to_max_length
 
-        # smaller CLIP backbone (base instead of large/huge)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_name_or_path)
         self.text_encoder = CLIPTextModel.from_pretrained(model_name_or_path)
 
     @property
     def device(self) -> torch.device:
         return next(self.text_encoder.parameters()).device
 
-    def forward(self, batch: Dict[str, Union[List[str], torch.Tensor]]) -> torch.Tensor:
-        texts = batch[self.from_key]  # assume list[str]
-        tokens = self.tokenizer(
-            texts,
-            padding=("max_length" if self.pad_to_max_length else True),
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        tokens = {k: v.to(self.device) for k, v in tokens.items()}
+    @torch.no_grad()
+    def tokenize(self, x: Union[List[str], torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Tokenize captions (list of strings) or wrap token IDs (tensor) for CLIPTextModel.
+        Returns: {"input_ids": ..., "attention_mask": ...}
+        """
+
+        if isinstance(x, torch.Tensor):
+            # Already token IDs
+            tokens = {"input_ids": x}
+
+        elif isinstance(x, list) and (len(x) == 0 or isinstance(x[0], str)):
+            # List[str] -> tokenize
+            tokens = self.tokenizer(
+                x,
+                padding=("max_length" if self.pad_to_max_length else True),
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+
+        else:
+            raise TypeError(f"Unsupported input for tokenize(): {type(x)}")
+
+        return {k: v.to(self.device) for k, v in tokens.items()}
+
+    def forward(self, x: Union[Dict, List[str], torch.Tensor]) -> torch.Tensor:
+        """
+        If x is a token dict/tensor, uses it directly; otherwise tokenizes first.
+        Returns last_hidden_state [B, T, D].
+        """
+        if (isinstance(x, dict) and "input_ids" in x) or isinstance(x, torch.Tensor):
+            tokens = x if isinstance(x, dict) else {"input_ids": x}
+            tokens = {k: v.to(self.device) for k, v in tokens.items()}
+        else:
+            tokens = self.tokenize(x)  # handles batch or list[str]
 
         outputs = self.text_encoder(**tokens, return_dict=True)
-        hidden = outputs.last_hidden_state  # [B, T, D]
-
-        return hidden
+        return outputs.last_hidden_state
     
 
 if __name__ == "__main__":

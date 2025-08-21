@@ -24,33 +24,35 @@ model:
         scaling_factor: 0.18215
 
   unet_config:
-      target: diffusers.models.unet_2d_condition.UNet2DConditionModel
-      params:
-        sample_size: 64
-        in_channels: 4
-        out_channels: 4
-        down_block_types: [DownBlock2D, CrossAttnDownBlock2D, CrossAttnDownBlock2D, CrossAttnDownBlock2D]
-        mid_block_type: UNetMidBlock2DCrossAttn
-        up_block_types:   [UpBlock2D, CrossAttnUpBlock2D, CrossAttnUpBlock2D, CrossAttnUpBlock2D]
-        block_out_channels: [320, 640, 1280, 1280]
-        layers_per_block: 2
-        cross_attention_dim: 2048
-        attention_head_dim: [8, 8, 8, 8]
-        center_input_sample: false
-        flip_sin_to_cos: true
-        freq_shift: 0
-        downsample_padding: 1
-        resnet_time_scale_shift: default
-        use_linear_projection: false
+    target: diffusers.models.unet_2d_condition.UNet2DConditionModel
+    params:
+      sample_size: 64                # latent size for 512x512 images
+      in_channels: 4
+      out_channels: 4
+      down_block_types: [DownBlock2D, CrossAttnDownBlock2D, CrossAttnDownBlock2D, CrossAttnDownBlock2D]
+      mid_block_type: UNetMidBlock2DCrossAttn
+      up_block_types:   [CrossAttnUpBlock2D, CrossAttnUpBlock2D, CrossAttnUpBlock2D, UpBlock2D]
+      block_out_channels: [320, 640, 1280, 1280]
+      layers_per_block: 2
+      cross_attention_dim: 768       # <-- SD v1
+      attention_head_dim: [5, 10, 20, 20]  # num heads per stage (head_dim=64)
+      center_input_sample: false
+      flip_sin_to_cos: true
+      freq_shift: 0
+      downsample_padding: 1
+      resnet_time_scale_shift: default
+      use_linear_projection: true     # SD v1 uses linear proj in SpatialTransformer
+      norm_num_groups: 32             # common SD v1 setting
+      act_fn: silu
 
   cond_stage_config:
-      target: encoders.encoders.SimpleSDTextEncoder
-      params:
-        model_name_or_path: openai/clip-vit-base-patch32
-        max_length: 77
-        from_key: captions         # batch["captions"]
-        pad_to_max_length: true
-        tokenizers_parallelism: false
+    target: encoders.encoders.SimpleSDTextEncoder
+    params:
+      model_name_or_path: openai/clip-vit-large-patch14   # <-- SD v1
+      max_length: 77
+      from_key: captions         # batch["captions"]
+      pad_to_max_length: true
+      tokenizers_parallelism: false
 
     # per-layer adapters stay here
   adapters_config:
@@ -60,7 +62,7 @@ model:
         scale_label: 1
         num_tokens_image: 4
         num_tokens_label: 4
-        share_ip_kv: true
+        share_ip_kv: false
 
   # ------------------------------------------------------------
   # Config for token conditioners (global encoders)
@@ -72,14 +74,14 @@ model:
         params:
           ip_num_tokens_label: 4
           in_features: 14
-          out_features: 2048
+          out_features: 768
           from_key: labels          # module will read batch["labels"]
       image_to_token:
         target: encoders.encoders.ImageToToken
         params:
           ip_num_tokens_image: 4
           in_features: 1024
-          out_features: 2048
+          out_features: 768
           from_key: image_embeds    # module will read batch["image_embeds"]  
 
     # Optional toggles (so you can freeze/train these nets)
@@ -97,9 +99,10 @@ model:
       label_to_token: null          # NEW: path if you have a checkpoint
       image_to_token: null          # NEW
 
-data:
-  target: datasets.datasets.DummyMultiModalDataset
-  params:
-    num_samples: 1000        # number of samples to generate
-    label_dim: 14            # size of the label vector
-    image_dim: 1024          # size of the image embedding
+datasets:
+  train_dataset:
+    target: datasets.datasets.DummyMultiModalDataset
+    params:
+      num_samples: 1000        # number of samples to generate
+      label_dim: 14            # size of the label vector
+      image_dim: 1024          # size of the image embedding
