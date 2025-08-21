@@ -1,51 +1,53 @@
-Here’s a complete README.md template you can drop into your repo and adjust as needed:
+# Stable Diffusion Training Framework with Adapter
 
-# Stable Diffusion XL with IP-Adapters and Extra Conditioning
-
-This project is a **config-driven training framework** for [Stable Diffusion XL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0), extended with:
+This repo provides a **config-driven training setup** for Stable Diffusion XL with:
 
 - **IP-Adapters** (per-layer attention processors).
-- **Extra conditioning modules**:
-  - `label_to_token`: maps label vectors → token embeddings.
-  - `embed_to_token`: maps external embeddings → token embeddings.
-
-The framework is designed to be modular: every component (UNet, VAE, schedulers, adapters, projectors) is defined in YAML and can be swapped or frozen without touching the training code.
+- Extra conditioning modules:
+  - `label_to_token`
+  - `embed_to_token`
 
 ---
 
-## 📌 Features
-
-- Configurable UNet, VAE, and schedulers (via YAML).
-- Support for **per-layer adapters** injected into UNet cross-attention.
-- External conditioning through **label/projector/embedding modules**.
-- Integration with [🤗 Accelerate](https://github.com/huggingface/accelerate).
-- Configurable checkpoint loading/saving.
-
----
-
-## ⚙️ Installation
-
-Clone and install dependencies:
+## 📦 Installation
 
 ```bash
 git clone <your-repo>
 cd <your-repo>
 pip install -r requirements.txt
+```
 
 Requirements include:
-	•	torch
-	•	diffusers
-	•	transformers
-	•	accelerate
-	•	pyyaml
+- torch
+- diffusers
+- transformers
+- accelerate
+- pyyaml
 
-⸻
+---
 
-🗂 Config Structure
+## 🚀 Training
 
-Training is controlled by a YAML config file.
-Example:
+```bash
+accelerate launch train.py \
+  --config configs/example.yaml \
+  --output_dir ./output
+```
 
+### Key CLI Flags
+- `--train_batch_size`
+- `--num_train_epochs`
+- `--mixed_precision` (`no`, `fp16`, `bf16`)
+- `--save_steps`
+- `--report_to` (`tensorboard`, `wandb`, etc.)
+
+---
+
+## 🗂 Config Structure
+
+Training is controlled by YAML configs, e.g.:
+
+```yaml
 model:
   params:
     unet_config: {...}
@@ -59,74 +61,65 @@ data:
     resolution: 1024
     data_root_path: /path/to/dataset
     pairs_file_path: /path/to/train.txt
+```
 
-	•	unet_config: defines the diffusion UNet.
-	•	first_stage_config: defines the VAE (encoder/decoder).
-	•	adapters_config: per-layer IP-Adapters, image/label projectors.
-	•	token_conditioners: extra modules for conditioning tokens.
+- `unet_config`: defines the diffusion UNet.  
+- `first_stage_config`: defines the VAE.  
+- `adapters_config`: per-layer IP-Adapters, image/label projectors.  
+- `token_conditioners`: extra modules for conditioning tokens.  
 
-See configs/example.yaml for a full template.
+See `configs/example.yaml` for a template.
 
-⸻
+---
 
-🚀 Training
+## 💾 Checkpoints
 
-Launch training with Accelerate:
+Checkpoints are saved in:
 
-accelerate launch train.py \
-  --config configs/example.yaml \
-  --output_dir ./output \
-  --train_batch_size 2 \
-  --num_train_epochs 100
+```
+output/checkpoint-<step>/
+```
 
-Key CLI flags
-	•	--mixed_precision: no, fp16, bf16
-	•	--report_to: tensorboard, wandb, etc.
-	•	--save_steps: checkpoint saving interval
+Each folder contains:
+- Model weights  
+- Optimizer state  
+- Scheduler state  
+- Accelerate state  
 
-⸻
+---
 
-📦 Checkpoints
+## 🧩 Extending
 
-Checkpoints are saved to:
+- Add new per-layer adapters in `adapters_config`.  
+- Add new conditioning modules under `token_conditioners`.  
+- Swap out VAE, UNet, or schedulers by editing the YAML config.  
 
-output_dir/checkpoint-<global_step>/
+---
 
-Each contains:
-	•	model weights
-	•	optimizer state
-	•	scheduler state
-	•	Accelerate state
-
-⸻
-
-🧩 Extending
-	•	Add new per-layer adapters by editing adapters_config.
-	•	Add new conditioning modules under token_conditioners.
-	•	Replace VAE, UNet, or schedulers by swapping their target class in YAML.
-
-⸻
-
-🔗 Architecture
+## 🔗 Architecture
 
 High-level flow:
 
-[text tokens] + [label_to_token(label vecs)] + [embed_to_token(embeds)] 
+```
+[text tokens] + [label_to_token(label vecs)] + [embed_to_token(embeds)]
         ↓
    concatenated conditioning sequence
         ↓
-   UNet (with IP-Adapters are injected into every cross-attention layer of the UNet. Each modality (e.g., image, label, embedding) has its own dedicated adapter branch, providing modality-specific cross-attention into the UNet, while the base UNet weights remain unchanged.)
+   UNet with IP-Adapters (per-layer cross-attn injections)
         ↓
        latents
         ↓
        VAE → images
+```
 
+- IP-Adapters = per-layer modules injected into UNet cross-attention.  
+- Label-to-token & embed-to-token = separate modules, independent of adapters.  
+- Modules can be frozen or trained depending on config flags.  
 
-⸻
+---
 
-📝 Notes
-	•	IP-Adapters are per-layer modules, created and injected into UNet cross-attention.
-	•	Label-to-token and embed-to-token are separate modules, not tied to per-layer adapters.
-	•	Each module can be frozen or trained depending on config flags.
-	•	This repo is designed for research flexibility, not production inference speed.
+## 📝 Notes
 
+- Modular design for research flexibility.  
+- Not optimized for inference speed.  
+- Works with Accelerate for distributed training.  
