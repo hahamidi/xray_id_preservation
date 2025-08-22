@@ -10,10 +10,11 @@ class DummyMultiModalDataset(Dataset):
 
         # just random captions
         self.caption_templates = [
-            "A sample caption",
-            "Another caption",
-            "Random description",
-            "Synthetic example",
+            "A man wearing a hat",
+            "A lion in the wild",
+            "A beautiful landscape",
+            "An astronaut in space",
+
         ]
 
     def __len__(self):

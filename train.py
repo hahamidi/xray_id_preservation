@@ -45,11 +45,19 @@ def maybe_freeze(module: Optional[nn.Module], train_flag: bool):
         return
     module.requires_grad_(bool(train_flag))
 
-def maybe_load_state_dict(module: Optional[nn.Module], path: Optional[str], strict: bool = False):
+def maybe_load_state_dict(module: Optional[nn.Module], path: Optional[str], strict: bool = True):
     if module is None or not path:
         return
-    sd = torch.load(path, map_location="cpu")
+
+    import os
+    if path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        sd = load_file(path, device="cpu")
+    else:
+        sd = torch.load(path, map_location="cpu")
+
     module.load_state_dict(sd, strict=strict)
+    return module
 
 from pydoc import locate as pydoc_locate
 
@@ -138,7 +146,7 @@ def set_ip_adapters(unet: UNet2DConditionModel, adapters_cfg: Optional[Dict], de
 # ------------------------------------------------------------
 # Wrapper
 # ------------------------------------------------------------
-class MultiAdaptorSDXL(nn.Module):
+class MultiAdaptorSD(nn.Module):
     def __init__(self, unet):
         super().__init__()
         self.unet = unet
@@ -149,10 +157,10 @@ class MultiAdaptorSDXL(nn.Module):
         # collect all available conditioning sequences
         if text_tokens is not None:
             seqs.append(text_tokens)
-        if image_tokens is not None:
-            seqs.append(image_tokens)
-        if label_tokens is not None:
-            seqs.append(label_tokens)
+        # if image_tokens is not None:
+        #     seqs.append(image_tokens)
+        # if label_tokens is not None:
+        #     seqs.append(label_tokens)
 
         # concatenate along sequence dimension, or None if no conditioning
         encoder_hidden_states = torch.cat(seqs, dim=1) if len(seqs) else None
@@ -177,34 +185,72 @@ class MultiAdaptorSDXL(nn.Module):
 # YAML builder
 # ------------------------------------------------------------
 def build_from_yaml(config_path: str):
+    """
+    Build all model components (scheduler, vae, unet, cond encoder, token conditioners)
+    from a YAML configuration file.
+    """
     with open(config_path, "r") as f:
         raw_cfg: Dict[str, Any] = yaml.safe_load(f)
+
     mcfg = raw_cfg["model"]
-    scheduler = DDPMScheduler.from_config(mcfg["scheduler_config"]["params"])
-    vae = AutoencoderKL.from_config(mcfg["first_stage_config"]["params"])
-    unet = UNet2DConditionModel.from_config(mcfg["unet_config"]["params"])
+
+    # --- Core components ---
+    scheduler = instantiate_from_target(
+        mcfg["scheduler_config"]["target"],
+        mcfg["scheduler_config"].get("params", {})
+    )
+    vae = instantiate_from_target(
+        mcfg["first_stage_config"]["target"],
+        mcfg["first_stage_config"].get("params", {})
+    )
+    unet = instantiate_from_target(
+        mcfg["unet_config"]["target"],
+        mcfg["unet_config"].get("params", {})
+    )
+
+    # --- Optional conditioning encoder ---
     cond_encoder = None
-    cond_cfg = mcfg.get("cond_stage_config")
-    if cond_cfg:
+    if "cond_stage_config" in mcfg:
+        cond_cfg = mcfg["cond_stage_config"]
         cond_encoder = instantiate_from_target(cond_cfg["target"], cond_cfg.get("params", {}))
-    token_conditioners_cfg = mcfg.get("token_conditioners", {}) or {}
+    if "tokenizer_config" in mcfg:
+        tokenizer_cfg = mcfg["tokenizer_config"]
+        tokenizer = instantiate_from_target(tokenizer_cfg["target"], tokenizer_cfg.get("params", {}))
+
+    # --- Token conditioners (label/image) ---
+    token_conditioners = mcfg.get("token_conditioners", {}) or {}
     label_to_token_model = None
-    if token_conditioners_cfg.get("label_to_token"):
+    if "label_to_token" in token_conditioners:
         label_to_token_model = instantiate_from_target(
-            token_conditioners_cfg["label_to_token"]["target"],
-            token_conditioners_cfg["label_to_token"].get("params", {})
+            token_conditioners["label_to_token"]["target"],
+            token_conditioners["label_to_token"].get("params", {})
         )
+
     image_to_token_model = None
-    if token_conditioners_cfg.get("image_to_token"):
+    if "image_to_token" in token_conditioners:
         image_to_token_model = instantiate_from_target(
-            token_conditioners_cfg["image_to_token"]["target"],
-            token_conditioners_cfg["image_to_token"].get("params", {})
+            token_conditioners["image_to_token"]["target"],
+            token_conditioners["image_to_token"].get("params", {})
         )
+
+    # --- Misc configs ---
     toggles: Dict[str, Any] = mcfg.get("trainable", {})
     weights: Dict[str, Any] = mcfg.get("weights", {})
     adapter_cfg: Optional[Dict[str, Any]] = mcfg.get("adapters_config")
-    return (raw_cfg, adapter_cfg, scheduler, vae, unet, cond_encoder,
-            image_to_token_model, label_to_token_model, toggles, weights)
+
+    return (
+        raw_cfg,
+        adapter_cfg,
+        scheduler,
+        vae,
+        unet,
+        cond_encoder,
+        tokenizer,
+        image_to_token_model,
+        label_to_token_model,
+        toggles,
+        weights,
+    )
 
 # ------------------------------------------------------------
 # Argparse
@@ -225,11 +271,13 @@ def parse_args():
     p.add_argument("--noise_offset", type=float, default=None)
 
     # ------ Visualization flags (only used by viz_utils.maybe_run_viz) ------
-    p.add_argument("--sample_every", type=int, default=10, help="Run viz hook every N global steps (0 disables).")
-    p.add_argument("--sample_inference_steps", type=int, default=25, help="Reverse diffusion steps for sampling.")
+    p.add_argument("--sample_every", type=int, default=1, help="Run viz hook every N global steps (0 disables).")
+    p.add_argument("--sample_inference_steps", type=int, default=45, help="Reverse diffusion steps for sampling.")
     p.add_argument("--sample_grid_rows", type=int, default=4)
     p.add_argument("--sample_grid_cols", type=int, default=4)
     p.add_argument("--samples_dir", type=str, default="samples", help="Subdir under output_dir to save PNGs.")
+
+    p.add_argument("--sample_guidance_scale", type=float, default=7.5, help="CFG scale for sampling.")
     return p.parse_args()
 
 # ------------------------------------------------------------
@@ -247,7 +295,7 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
 
     (
-        raw_cfg, adapter_cfg, scheduler, vae, unet, cond_encoder,
+        raw_cfg, adapter_cfg, scheduler, vae, unet, cond_encoder, tokenizer,
         image_to_token_model, label_to_token_model, toggles, weights
     ) = build_from_yaml(args.config)
 
@@ -262,26 +310,27 @@ def main():
         compute_dtype = torch.float32
 
     # ---- ADAPTERS ----
-    adapter_modules = set_ip_adapters(unet=unet, device=accelerator.device,
-                                      dtype=param_dtype, adapters_cfg=adapter_cfg)
+
+    # adapter_modules = set_ip_adapters(unet=unet, device=accelerator.device,
+    #                                   dtype=param_dtype, adapters_cfg=adapter_cfg)
 
     # ---- FREEZE ----
     maybe_freeze(unet, toggles.get("unet", True))
-    maybe_freeze(cond_encoder, toggles.get("cond_encoder", False))
+    maybe_freeze(cond_encoder, toggles.get("cond_stage", False))
     maybe_freeze(image_to_token_model, toggles.get("image_to_token", True))
     maybe_freeze(label_to_token_model, toggles.get("label_to_token", True))
-    maybe_freeze(adapter_modules, toggles.get("adapters", True))
+    # maybe_freeze(adapter_modules, toggles.get("adapters", True))
     vae.requires_grad_(False)
 
     # ---- LOAD WEIGHTS ----
     maybe_load_state_dict(unet, weights.get("main_model") or weights.get("unet"))
     maybe_load_state_dict(vae, weights.get("vae"))
-    maybe_load_state_dict(cond_encoder, weights.get("cond_encoder"))
+    maybe_load_state_dict(cond_encoder, weights.get("cond_stage"))
     maybe_load_state_dict(image_to_token_model, weights.get("image_to_token"))
     maybe_load_state_dict(label_to_token_model, weights.get("label_to_token"))
-    maybe_load_state_dict(adapter_modules, weights.get("adapters"))
+    # maybe_load_state_dict(adapter_modules, weights.get("adapters"))
 
-    model = MultiAdaptorSDXL(unet=unet)
+    model = MultiAdaptorSD(unet=unet)
 
     if accelerator.is_main_process:
         print("\n========== MODEL REPORT ==========")
@@ -290,7 +339,7 @@ def main():
         report_module("CondEncoder", cond_encoder)
         report_module("ImageToToken", image_to_token_model)
         report_module("LabelToToken", label_to_token_model)
-        report_module("Adapters", adapter_modules)
+        # report_module("Adapters", adapter_modules)
         print("=================================\n")
 
     # ---- OPTIMIZER ----
@@ -351,11 +400,17 @@ def main():
                 )
                 noisy_latents = scheduler.add_noise(latents, noise, timesteps)
 
-                ids = cond_encoder.tokenize(batch['captions'])
-                ids = {k: v.to(non_blocking=True) for k, v in ids.items()}
-                ce_grads = cond_encoder is not None and any(p.requires_grad for p in cond_encoder.parameters())
+                tokens = tokenizer(
+                    batch["captions"],
+                    padding="max_length", truncation=True, max_length=77,
+                    return_tensors="pt",
+                )
+                tokens = {k: v.to(device=latents.device, non_blocking=True) for k, v in tokens.items()}
+
+                ce_grads = any(p.requires_grad for p in cond_encoder.parameters())
                 with torch.set_grad_enabled(ce_grads):
-                    text_tokens = cond_encoder(ids)
+                    text_out = cond_encoder(**tokens, return_dict=True)
+                    text_tokens = text_out.last_hidden_state                  # [B, 77, 768]
                 text_tokens = text_tokens.to(dtype=compute_dtype)
 
                 image_embeddings = batch["image_embeds"].to(dtype=compute_dtype, non_blocking=True)
@@ -399,6 +454,7 @@ def main():
                     vae=vae,
                     scheduler_train=scheduler,
                     cond_encoder=cond_encoder,
+                    tokenizer=tokenizer,
                     image_to_token_model=image_to_token_model,
                     label_to_token_model=label_to_token_model,
                     compute_dtype=compute_dtype,

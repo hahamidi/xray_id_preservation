@@ -1,0 +1,79 @@
+model:
+  base_learning_rate: 5.0e-05
+
+  scheduler_config:
+    target: modules.hf_wrappers.SchedulerFromHF
+    params:
+      repo_id: runwayml/stable-diffusion-v1-5
+
+  first_stage_config:
+    target: modules.hf_wrappers.FirstStageFromHF
+    params:
+      repo_id: runwayml/stable-diffusion-v1-5
+
+  unet_config:
+    target: modules.hf_wrappers.UNetFromHF
+    params:
+      repo_id: runwayml/stable-diffusion-v1-5
+
+  # NEW: tokenizer loaded separately
+  tokenizer_config:
+    target: modules.hf_wrappers.TextTokenizerFromHF
+    params:
+      repo_id: runwayml/stable-diffusion-v1-5    # uses subfolder "tokenizer"
+
+  # Text encoder (CLIP ViT-L/14) from SD 1.5 repo
+  cond_stage_config:
+    target: modules.hf_wrappers.TextEncoderFromHF
+    params:
+      repo_id: runwayml/stable-diffusion-v1-5    # uses subfolder "text_encoder"
+      torch_dtype: float32
+      device: cuda
+
+  adapters_config:
+    target: modules.adapter.IPAttnProcessor
+    params:
+      scale_image: 0.001
+      scale_label: 0.001
+      num_tokens_image: 4
+      num_tokens_label: 4
+      share_ip_kv: false
+
+  token_conditioners:
+    label_to_token:
+      target: encoders.encoders.LabelToToken
+      params:
+        ip_num_tokens_label: 4
+        in_features: 14
+        out_features: 768
+        from_key: labels
+    image_to_token:
+      target: encoders.encoders.ImageToToken
+      params:
+        ip_num_tokens_image: 4
+        in_features: 1024
+        out_features: 768
+        from_key: image_embeds
+
+  trainable:
+    unet: false
+    cond_stage: true          # train CLIP text encoder if you want; set false to freeze
+    adapters: false
+    label_to_token: false
+    embed_to_token: false
+
+  weights:
+    unet: null
+    vae: null
+    cond_stage: null
+    adapters: null
+    label_to_token: null
+    image_to_token: null
+
+datasets:
+  train_dataset:
+    target: datasets.datasets.DummyMultiModalDataset
+    params:
+      num_samples: 1000
+      label_dim: 14
+      image_dim: 1024

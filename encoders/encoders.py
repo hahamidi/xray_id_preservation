@@ -46,29 +46,28 @@ class ImageToToken(nn.Module):
         return out.view(b, self.num_tokens, self.out_features)  # [B, T, D]
     
   
-
-
-
-from typing import Dict, List, Union, Optional
+from typing import Dict, List, Union
 import torch
 import torch.nn as nn
 from transformers import CLIPTokenizer, CLIPTextModel
 
 class SimpleSDTextEncoder(nn.Module):
     """
-    Reads text strings from batch[from_key] (or token IDs) and returns embeddings [B, T, D].
-    Usage:
-        ids = enc.tokenize(batch)       # batch[from_key] is list[str] or token IDs
-        hidden = enc(ids)               # [B, T, D]
+    SD 1.5-compatible CLIP text encoder.
+    Returns last_hidden_state [B, T, D] with D=768 and T<=77.
     """
 
     def __init__(
         self,
-        model_name_or_path: str = "openai/clip-vit-base-patch32",
+        use_sd15_repo: bool = True,
+        sd15_repo_id: str = "runwayml/stable-diffusion-v1-5",
+        clip_l14_id: str = "openai/clip-vit-large-patch14",
         max_length: int = 77,
         from_key: str = "captions",
         pad_to_max_length: bool = True,
         tokenizers_parallelism: bool = False,
+        torch_dtype: torch.dtype = torch.float32,
+        device: Union[str, torch.device] = "cpu",
     ):
         super().__init__()
         import os
@@ -78,8 +77,24 @@ class SimpleSDTextEncoder(nn.Module):
         self.max_length = max_length
         self.pad_to_max_length = pad_to_max_length
 
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_name_or_path)
-        self.text_encoder = CLIPTextModel.from_pretrained(model_name_or_path)
+        if use_sd15_repo:
+            # EXACTLY the tokenizer/weights SD 1.5 ships with
+            self.tokenizer = CLIPTokenizer.from_pretrained(sd15_repo_id, subfolder="tokenizer")
+            self.text_encoder = CLIPTextModel.from_pretrained(sd15_repo_id, subfolder="text_encoder", torch_dtype=torch_dtype)
+        else:
+            # Same architecture/weights for text tower (ViT-L/14)
+            self.tokenizer = CLIPTokenizer.from_pretrained(clip_l14_id)
+            self.text_encoder = CLIPTextModel.from_pretrained(clip_l14_id, torch_dtype=torch_dtype)
+
+        self.text_encoder.to(device)
+        # Ensure tokenizer length behavior matches SD 1.x expectations
+        try:
+            self.tokenizer.model_max_length = max_length
+        except Exception:
+            pass
+
+        # Optional: hard sanity checks against the SD 1.5 config you wanted
+        self._assert_sd15_text_config()
 
     @property
     def device(self) -> torch.device:
@@ -87,17 +102,9 @@ class SimpleSDTextEncoder(nn.Module):
 
     @torch.no_grad()
     def tokenize(self, x: Union[List[str], torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Tokenize captions (list of strings) or wrap token IDs (tensor) for CLIPTextModel.
-        Returns: {"input_ids": ..., "attention_mask": ...}
-        """
-
         if isinstance(x, torch.Tensor):
-            # Already token IDs
             tokens = {"input_ids": x}
-
         elif isinstance(x, list) and (len(x) == 0 or isinstance(x[0], str)):
-            # List[str] -> tokenize
             tokens = self.tokenizer(
                 x,
                 padding=("max_length" if self.pad_to_max_length else True),
@@ -105,25 +112,34 @@ class SimpleSDTextEncoder(nn.Module):
                 max_length=self.max_length,
                 return_tensors="pt",
             )
-
         else:
             raise TypeError(f"Unsupported input for tokenize(): {type(x)}")
 
         return {k: v.to(self.device) for k, v in tokens.items()}
 
     def forward(self, x: Union[Dict, List[str], torch.Tensor]) -> torch.Tensor:
-        """
-        If x is a token dict/tensor, uses it directly; otherwise tokenizes first.
-        Returns last_hidden_state [B, T, D].
-        """
         if (isinstance(x, dict) and "input_ids" in x) or isinstance(x, torch.Tensor):
             tokens = x if isinstance(x, dict) else {"input_ids": x}
             tokens = {k: v.to(self.device) for k, v in tokens.items()}
         else:
-            tokens = self.tokenize(x)  # handles batch or list[str]
+            tokens = self.tokenize(x)
 
         outputs = self.text_encoder(**tokens, return_dict=True)
-        return outputs.last_hidden_state
+        return outputs.last_hidden_state  # [B, T(<=77), 768]
+
+    # --- internals ---
+    def _assert_sd15_text_config(self):
+        cfg = self.text_encoder.config
+        # Exactly what you listed earlier for SD 1.5
+        assert getattr(cfg, "hidden_size", None) == 768, f"hidden_size {cfg.hidden_size}"
+        assert getattr(cfg, "num_hidden_layers", None) == 12, f"layers {cfg.num_hidden_layers}"
+        assert getattr(cfg, "num_attention_heads", None) == 12, f"heads {cfg.num_attention_heads}"
+        assert getattr(cfg, "intermediate_size", None) == 3072, f"mlp {cfg.intermediate_size}"
+        assert getattr(cfg, "max_position_embeddings", None) == 77, f"max_pos {cfg.max_position_embeddings}"
+        assert getattr(cfg, "vocab_size", None) == 49408, f"vocab {cfg.vocab_size}"
+        assert getattr(cfg, "projection_dim", None) == 768, f"proj {cfg.projection_dim}"
+        # HF sometimes aliases quick_gelu as gelu_new
+        assert getattr(cfg, "hidden_act", None) in ("quick_gelu", "gelu_new"), f"act {cfg.hidden_act}"
     
 
 if __name__ == "__main__":

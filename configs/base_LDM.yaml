@@ -12,61 +12,74 @@ model:
         variance_type: fixed_small
 
   first_stage_config:
-      target: diffusers.models.autoencoder_kl.AutoencoderKL
-      params:
-        act_fn: silu
-        block_out_channels: [128, 256, 512, 512]
-        down_block_types: [DownEncoderBlock2D, DownEncoderBlock2D, DownEncoderBlock2D, DownEncoderBlock2D]
-        up_block_types:   [UpDecoderBlock2D,   UpDecoderBlock2D,   UpDecoderBlock2D,   UpDecoderBlock2D]
-        latent_channels: 4
-        in_channels: 3
-        out_channels: 3
-        scaling_factor: 0.18215
+    target: diffusers.models.autoencoder_kl.AutoencoderKL
+    params:
+      act_fn: silu
+      block_out_channels: [128, 256, 512, 512]
+      down_block_types:
+        - DownEncoderBlock2D
+        - DownEncoderBlock2D
+        - DownEncoderBlock2D
+        - DownEncoderBlock2D
+      in_channels: 3
+      latent_channels: 4
+      layers_per_block: 2
+      norm_num_groups: 32
+      out_channels: 3
+      sample_size: 512
+      up_block_types:
+        - UpDecoderBlock2D
+        - UpDecoderBlock2D
+        - UpDecoderBlock2D
+        - UpDecoderBlock2D
 
   unet_config:
-    target: diffusers.models.unet_2d_condition.UNet2DConditionModel
-    params:
-      sample_size: 64                # latent size for 512x512 images
-      in_channels: 4
-      out_channels: 4
-      down_block_types: [DownBlock2D, CrossAttnDownBlock2D, CrossAttnDownBlock2D, CrossAttnDownBlock2D]
-      mid_block_type: UNetMidBlock2DCrossAttn
-      up_block_types:   [CrossAttnUpBlock2D, CrossAttnUpBlock2D, CrossAttnUpBlock2D, UpBlock2D]
-      block_out_channels: [320, 640, 1280, 1280]
-      layers_per_block: 2
-      cross_attention_dim: 768       # <-- SD v1
-      attention_head_dim: [5, 10, 20, 20]  # num heads per stage (head_dim=64)
-      center_input_sample: false
-      flip_sin_to_cos: true
-      freq_shift: 0
-      downsample_padding: 1
-      resnet_time_scale_shift: default
-      use_linear_projection: true     # SD v1 uses linear proj in SpatialTransformer
-      norm_num_groups: 32             # common SD v1 setting
-      act_fn: silu
+      target: diffusers.models.unet_2d_condition.UNet2DConditionModel
+      params:
+        act_fn: silu
+        attention_head_dim: 8
+        block_out_channels: [320, 640, 1280, 1280]
+        center_input_sample: false
+        cross_attention_dim: 768
+        down_block_types:
+          - CrossAttnDownBlock2D
+          - CrossAttnDownBlock2D
+          - CrossAttnDownBlock2D
+          - DownBlock2D
+        downsample_padding: 1
+        flip_sin_to_cos: true
+        freq_shift: 0
+        in_channels: 4
+        layers_per_block: 2
+        mid_block_scale_factor: 1
+        norm_eps: 1.0e-05
+        norm_num_groups: 32
+        out_channels: 4
+        sample_size: 64
+        up_block_types:
+          - UpBlock2D
+          - CrossAttnUpBlock2D
+          - CrossAttnUpBlock2D
+          - CrossAttnUpBlock2D
 
   cond_stage_config:
     target: encoders.encoders.SimpleSDTextEncoder
     params:
-      model_name_or_path: openai/clip-vit-large-patch14   # <-- SD v1
+      use_sd15_repo: true
+      sd15_repo_id: runwayml/stable-diffusion-v1-5
       max_length: 77
-      from_key: captions         # batch["captions"]
+      from_key: captions
       pad_to_max_length: true
       tokenizers_parallelism: false
 
-    # per-layer adapters stay here
   adapters_config:
       target: modules.adapter.IPAttnProcessor
       params:
-        scale_image: 1
-        scale_label: 1
+        scale_image: 0.001
+        scale_label: 0.001
         num_tokens_image: 4
         num_tokens_label: 4
         share_ip_kv: false
-
-  # ------------------------------------------------------------
-  # Config for token conditioners (global encoders)
-  # ------------------------------------------------------------
 
   token_conditioners:
       label_to_token:
@@ -75,34 +88,34 @@ model:
           ip_num_tokens_label: 4
           in_features: 14
           out_features: 768
-          from_key: labels          # module will read batch["labels"]
+          from_key: labels
       image_to_token:
         target: encoders.encoders.ImageToToken
         params:
           ip_num_tokens_image: 4
           in_features: 1024
           out_features: 768
-          from_key: image_embeds    # module will read batch["image_embeds"]  
+          from_key: image_embeds  
 
-    # Optional toggles (so you can freeze/train these nets)
   trainable:
-      unet: true
-      cond_stage: false
-      adapters: true
-      label_to_token: true          # NEW
-      embed_to_token: true          # NEW
+      unet: false
+      cond_stage: true
+      adapters: false
+      label_to_token: false
+      embed_to_token: false
 
   weights:
-      main_model: null
-      vae: null
-      adapters: null
-      label_to_token: null          # NEW: path if you have a checkpoint
-      image_to_token: null          # NEW
+    unet: "/projects/hhamidi/xray-id/sd15_components/unet/diffusion_pytorch_model.safetensors"
+    vae: "/projects/hhamidi/xray-id/sd15_components/vae/diffusion_pytorch_model.safetensors"
+    cond_stage: null
+    adapters: null
+    label_to_token: null
+    image_to_token: null
 
 datasets:
   train_dataset:
     target: datasets.datasets.DummyMultiModalDataset
     params:
-      num_samples: 1000        # number of samples to generate
-      label_dim: 14            # size of the label vector
-      image_dim: 1024          # size of the image embedding
+      num_samples: 1000
+      label_dim: 14
+      image_dim: 1024
